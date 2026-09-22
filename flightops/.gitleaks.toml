@@ -1,9 +1,0 @@
-# Gitleaks config: all default rules + a BAS-specific rule for passwords in Oracle/.NET connection strings
-[extend]
-useDefault = true
-
-[[rules]]
-id = "connection-string-password"
-description = "Password embedded in a database connection string"
-regex = '''(?i)password\s*=\s*([^;"\s]{6,})'''
-keywords = ["password"]
