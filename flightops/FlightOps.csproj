@@ -6,7 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- INSECURE: old Newtonsoft.Json with a known HIGH vulnerability (CVE-2024-21907). Fix: 13.0.3 -->
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.3 />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="3.21.*" />
   </ItemGroup>
 </Project>
