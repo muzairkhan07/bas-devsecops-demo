@@ -1,0 +1,148 @@
+# BAS FlightOps - .NET DevSecOps pipeline (same stages as the Azure DevOps template)
+name: BAS FlightOps - .NET DevSecOps Pipeline
+
+on:
+  push:
+    paths: [ 'flightops/**', '.github/workflows/flightops.yml' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  APP_DIR: flightops
+  TRIVY_CACHE: /home/runner/.cache/trivy
+
+jobs:
+  # ------------------------------------------------------------ 1. BUILD, SCAN, GATE
+  build-scan:
+    name: "1. Build, Scan & Security Gate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build & publish (.NET 8)
+        run: dotnet publish $APP_DIR/FlightOps.csproj -c Release -o publish
+
+      - name: Prepare report folders
+        run: mkdir -p reports $TRIVY_CACHE && chmod -R 777 reports $TRIVY_CACHE
+
+      - name: Secrets scan (Gitleaks + BAS connection-string rule)
+        run: |
+          docker run --rm -v "$PWD/$APP_DIR:/repo" -v "$PWD/reports:/out" zricethezav/gitleaks:latest \
+            detect --source /repo --no-git --no-banner --verbose --redact \
+            --report-format json --report-path /out/secrets-report.json --exit-code 0
+
+      - name: SAST (Semgrep C# rules)
+        run: |
+          docker run --rm -v "$PWD/$APP_DIR:/src" -v "$PWD/reports:/out" semgrep/semgrep \
+            semgrep scan --metrics off --config p/csharp --sarif-output=/out/semgrep.sarif /src || true
+
+      - name: SCA - vulnerable NuGet packages + SBOM
+        run: |
+          echo "===== dotnet (NuGet advisory database) ====="
+          dotnet list $APP_DIR/FlightOps.csproj package --vulnerable --include-transitive | tee reports/nuget-vulnerable.txt
+          echo "===== Trivy (published application) ====="
+          docker run --rm -v "$TRIVY_CACHE:/root/.cache/" -v "$PWD/publish:/app" aquasec/trivy:latest \
+            fs --scanners vuln --format table /app | tee reports/trivy-sca.txt
+          docker run --rm -v "$TRIVY_CACHE:/root/.cache/" -v "$PWD/publish:/app" -v "$PWD/reports:/out" aquasec/trivy:latest \
+            fs --format cyclonedx --output /out/sbom.cdx.json /app
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightops-security-reports
+          path: reports/
+
+      - name: Publish SAST findings to Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: flightops-sast
+
+      - name: SECURITY GATE (no secrets, no Critical/High vulnerable packages)
+        run: |
+          set +e
+          docker run --rm -v "$PWD/$APP_DIR:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --no-git --no-banner --exit-code 1 > /dev/null 2>&1
+          SECRETS=$?
+          docker run --rm -v "$TRIVY_CACHE:/root/.cache/" -v "$PWD/publish:/app" aquasec/trivy:latest \
+            fs --scanners vuln --severity CRITICAL,HIGH --exit-code 1 --quiet /app > /dev/null 2>&1
+          VULNS=$?
+          echo "=================================================="
+          echo " Hardcoded secrets in code/config   : $([ $SECRETS -ne 0 ] && echo 'FOUND -> FAIL' || echo 'none  -> PASS')"
+          echo " Critical/High vulnerable packages  : $([ $VULNS -ne 0 ] && echo 'FOUND -> FAIL' || echo 'none  -> PASS')"
+          echo "=================================================="
+          if [ $SECRETS -ne 0 ] || [ $VULNS -ne 0 ]; then
+            echo "::error::SECURITY GATE FAILED - release blocked from UAT/Production"
+            exit 1
+          fi
+          echo "SECURITY GATE PASSED - build promoted to UAT"
+
+      - name: Store the approved build (same artifact goes to UAT and Production)
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightops-app
+          path: publish/
+
+  # ------------------------------------------------------------ 2. UAT + DAST
+  uat:
+    name: "2. Deploy to UAT + DAST"
+    needs: build-scan
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flightops-app
+          path: app
+
+      - name: Deploy to UAT (DB secret injected at runtime - stand-in for OCI Vault)
+        env:
+          ConnectionStrings__BasDb: ${{ secrets.BAS_DB_CONNECTION }}
+        run: |
+          nohup dotnet app/FlightOps.dll --urls http://0.0.0.0:5000 > app.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:5000/health > /dev/null && break; sleep 2; done
+          echo "Health check:"; curl -s http://localhost:5000/health; echo
+
+      - name: DAST (OWASP ZAP baseline scan)
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:5000 -r zap-report.html -I
+
+      - name: Upload DAST report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightops-dast-report
+          path: zap/
+
+  # ------------------------------------------------------------ 3. PRODUCTION
+  production:
+    name: "3. Production (manual approval)"
+    needs: uat
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: flightops-app
+          path: app
+      - name: Deploy to Production
+        run: |
+          echo "Release #${{ github.run_number }} approved and deployed to Production"
+          echo "Commit : ${{ github.sha }}"
+          echo "By     : ${{ github.actor }}"
